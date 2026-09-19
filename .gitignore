@@ -1,0 +1,7 @@
+build/
+tests/out/
+*.log
+*.pdb
+*.ilk
+*.exp
+*.lib
