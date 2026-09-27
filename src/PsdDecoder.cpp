@@ -96,27 +96,42 @@ float ReadBeF32(const uint8_t* p) {
     return f;
 }
 
-// Converts one raw channel row into float samples: 0..255 for 8/16-bit and bitmap, linear light for 32-bit.
-void ConvertRow(const uint8_t* raw, uint32_t width, uint16_t depth, float* out) {
-    switch (depth) {
-    case 8:
-        for (uint32_t x = 0; x < width; ++x) out[x] = raw[x];
-        break;
-    case 16:
-        for (uint32_t x = 0; x < width; ++x) out[x] = (float)((raw[2 * x] << 8) | raw[2 * x + 1]) * (255.f / 65535.f);
-        break;
-    case 32:
-        for (uint32_t x = 0; x < width; ++x) {
-            const float f = ReadBeF32(raw + 4 * x);
-            out[x] = std::isfinite(f) ? f : 0.f;
+// Adds, for every output column tx, the sum of source samples x in [colStart[tx], colStart[tx + 1])
+// to acc[tx * stride]. Units: 0..255 for 8/16-bit and bitmap, linear light for 32-bit.
+void AccumulateRow(const uint8_t* raw, uint16_t depth, const uint32_t* colStart, uint32_t tw, float* acc, uint32_t stride) {
+    for (uint32_t tx = 0; tx < tw; ++tx, acc += stride) {
+        const uint32_t x0 = colStart[tx], x1 = colStart[tx + 1];
+        switch (depth) {
+        case 8: {
+            uint32_t s = 0;
+            for (uint32_t x = x0; x < x1; ++x) s += raw[x];
+            *acc += (float)s;
+            break;
         }
-        break;
-    case 1:
-        for (uint32_t x = 0; x < width; ++x) out[x] = (raw[x >> 3] & (0x80 >> (x & 7))) ? 0.f : 255.f;  // 1 = black
-        break;
-    default:
-        for (uint32_t x = 0; x < width; ++x) out[x] = 0.f;
-        break;
+        case 16: {
+            uint64_t s = 0;
+            for (uint32_t x = x0; x < x1; ++x) s += (uint32_t)((raw[2 * x] << 8) | raw[2 * x + 1]);
+            *acc += (float)s * (255.f / 65535.f);
+            break;
+        }
+        case 32: {
+            float s = 0.f;
+            for (uint32_t x = x0; x < x1; ++x) {
+                const float f = ReadBeF32(raw + 4 * x);
+                if (std::isfinite(f)) s += f;
+            }
+            *acc += s;
+            break;
+        }
+        case 1: {
+            uint32_t white = 0;
+            for (uint32_t x = x0; x < x1; ++x) white += (raw[x >> 3] & (0x80 >> (x & 7))) ? 0u : 1u;  // 1 = black
+            *acc += (float)white * 255.f;
+            break;
+        }
+        default:
+            break;
+        }
     }
 }
 
@@ -344,18 +359,19 @@ PsdResult PsdDecoder::DecodeComposite(Reader& r, const PsdInfo& info, uint32_t m
     // Sample about twice as many source rows as output rows; every output row gets >= 1 sample.
     const uint32_t rowStep = std::max<uint32_t>(1, H / (th * 2));
 
-    std::vector<uint32_t> colBin(W), colCount(tw, 0), rowCount(th, 0);
-    for (uint32_t x = 0; x < W; ++x) {
-        const uint32_t tx = (uint32_t)(((uint64_t)x * tw) / W);
-        colBin[x] = tx;
-        colCount[tx]++;
-    }
+    // Read-ahead only pays off when the next sampled row lands in the same buffer;
+    // otherwise every refill drags in rows we are about to skip.
+    const uint64_t avgRowBytes = info.compression == 1 ? (rleOffsets[(size_t)nRows] - rleOffsets[0]) / nRows : rowBytes;
+    if (avgRowBytes * rowStep > r.BufferSize()) r.SetReadAhead(0);
+
+    // Output column tx averages source columns [colStart[tx], colStart[tx + 1]).
+    std::vector<uint32_t> colStart(tw + 1), rowCount(th, 0);
+    for (uint32_t tx = 0; tx <= tw; ++tx) colStart[tx] = (uint32_t)(((uint64_t)tx * W + tw - 1) / tw);
 
     const bool indexed = info.colorMode == PSD_INDEXED;
     const uint32_t nAcc = indexed ? 3 : chRead;
     std::vector<float> acc((size_t)tw * th * nAcc, 0.f);
     std::vector<uint8_t> raw((size_t)rowBytes), packed;
-    std::vector<float> samples(W);
     const uint64_t maxPacked = rowBytes * 2 + 64;
 
     for (uint32_t c = 0; c < chRead; ++c) {
@@ -376,16 +392,21 @@ PsdResult PsdDecoder::DecodeComposite(Reader& r, const PsdInfo& info, uint32_t m
             float* accRow = acc.data() + (size_t)ty * tw * nAcc;
             if (indexed) {
                 const uint8_t* pal = info.palette.data();
-                for (uint32_t x = 0; x < W; ++x) {
-                    const uint8_t i = raw[x];
-                    float* a = accRow + (size_t)colBin[x] * 3;
-                    a[0] += pal[i];
-                    a[1] += pal[256 + i];
-                    a[2] += pal[512 + i];
+                for (uint32_t tx = 0; tx < tw; ++tx) {
+                    uint32_t s0 = 0, s1 = 0, s2 = 0;
+                    for (uint32_t x = colStart[tx]; x < colStart[tx + 1]; ++x) {
+                        const uint8_t i = raw[x];
+                        s0 += pal[i];
+                        s1 += pal[256 + i];
+                        s2 += pal[512 + i];
+                    }
+                    float* a = accRow + (size_t)tx * 3;
+                    a[0] += (float)s0;
+                    a[1] += (float)s1;
+                    a[2] += (float)s2;
                 }
             } else {
-                ConvertRow(raw.data(), W, info.depth, samples.data());
-                for (uint32_t x = 0; x < W; ++x) accRow[(size_t)colBin[x] * nAcc + c] += samples[x];
+                AccumulateRow(raw.data(), info.depth, colStart.data(), tw, accRow + c, nAcc);
             }
         }
     }
@@ -401,7 +422,7 @@ PsdResult PsdDecoder::DecodeComposite(Reader& r, const PsdInfo& info, uint32_t m
     for (uint32_t ty = 0; ty < th; ++ty) {
         const float* accRow = acc.data() + (size_t)ty * tw * nAcc;
         for (uint32_t tx = 0; tx < tw; ++tx, dst += 4) {
-            const float n = (float)rowCount[ty] * (float)colCount[tx];
+            const float n = (float)rowCount[ty] * (float)(colStart[tx + 1] - colStart[tx]);
             const float inv = n > 0.f ? 1.f / n : 0.f;
             for (uint32_t k = 0; k < nAcc; ++k) v[k] = accRow[(size_t)tx * nAcc + k] * inv;
             if (isFloat) {

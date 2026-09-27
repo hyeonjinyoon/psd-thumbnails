@@ -24,7 +24,7 @@ bool Reader::Skip(uint64_t n) {
     return Seek(m_pos + n);
 }
 
-bool Reader::Fill(uint64_t pos) {
+bool Reader::Fill(uint64_t pos, size_t want) {
     if (!m_stream) return false;
     if (!m_streamPosKnown || m_streamPos != pos) {
         LARGE_INTEGER li;
@@ -38,8 +38,11 @@ bool Reader::Fill(uint64_t pos) {
         m_streamPosKnown = true;
         if (m_streamPos != pos) return false;
     }
+    const size_t cap = m_buf.size();
+    const size_t need = want < cap ? want : cap;
+    const size_t len = m_readAhead < cap - need ? need + m_readAhead : cap;
     ULONG got = 0;
-    const HRESULT hr = m_stream->Read(m_buf.data(), (ULONG)m_buf.size(), &got);
+    const HRESULT hr = m_stream->Read(m_buf.data(), (ULONG)len, &got);
     if (FAILED(hr) || got == 0) {
         m_streamPosKnown = false;
         m_bufLen = 0;
@@ -62,7 +65,7 @@ bool Reader::Read(void* dst, size_t n) {
             out += take;
             n -= take;
             m_pos += take;
-        } else if (!Fill(m_pos)) {
+        } else if (!Fill(m_pos, n)) {
             return false;
         }
     }

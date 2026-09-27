@@ -29,8 +29,12 @@ public:
     bool ReadI16(int16_t& v);
     bool ReadLen(bool wide, uint64_t& v);  // u32 (PSD) or u64 (PSB)
 
+    // Caps how far a buffer refill reads past the requested bytes (0 = only what was asked for).
+    void SetReadAhead(size_t n) { m_readAhead = n; }
+    size_t BufferSize() const { return m_buf.size(); }
+
 private:
-    bool Fill(uint64_t pos);
+    bool Fill(uint64_t pos, size_t want);
 
     IStream* m_stream;
     std::vector<uint8_t> m_buf;
@@ -40,4 +44,5 @@ private:
     uint64_t m_streamPos = 0;
     bool m_streamPosKnown = false;
     uint64_t m_size = kUnknownSize;
+    size_t m_readAhead = ~(size_t)0;
 };
